@@ -29,6 +29,10 @@ use super::{
         streaming_codex_chat::create_responses_sse_stream_from_chat_with_context,
         streaming_gemini::create_anthropic_sse_stream_from_gemini,
         streaming_responses::create_anthropic_sse_stream_from_responses_with_web_search_options_for_client,
+        streaming_retry::{
+            create_resilient_anthropic_sse_stream_from_responses_with_web_search_options_for_client,
+            StreamReconnector,
+        },
         transform, transform_codex_anthropic, transform_codex_chat,
         transform_codex_responses_namespace, transform_gemini, transform_responses,
     },
@@ -224,6 +228,7 @@ async fn handle_messages_for_app(
     };
 
     let connection_guard = result.connection_guard.take();
+    let stream_reconnect = result.stream_reconnect.take();
     ctx.outbound_model = result.outbound_model.take();
     ctx.provider = result.provider;
     let api_format = result
@@ -253,6 +258,7 @@ async fn handle_messages_for_app(
             &api_format,
             preserve_redacted_thinking,
             connection_guard,
+            stream_reconnect,
         )
         .await;
     }
@@ -382,6 +388,7 @@ fn spawn_claude_usage_log(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_claude_transform(
     response: super::hyper_client::ProxyResponse,
     ctx: &RequestContext,
@@ -391,6 +398,7 @@ async fn handle_claude_transform(
     api_format: &str,
     preserve_redacted_thinking: bool,
     connection_guard: Option<ActiveConnectionGuard>,
+    stream_reconnect: Option<StreamReconnector>,
 ) -> Result<axum::response::Response, ProxyError> {
     let status = response.status();
     let is_codex_oauth = ctx
@@ -429,25 +437,15 @@ async fn handle_claude_transform(
         let sse_stream: Box<
             dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin,
         > = if api_format == "openai_responses" {
-            if hosted_web_search_name.is_none() && hosted_web_search_max_uses.is_none() {
-                Box::new(Box::pin(
-                    create_anthropic_sse_stream_from_responses_with_web_search_options_for_client(
-                        stream,
-                        None,
-                        None,
-                        preserve_redacted_thinking,
-                    ),
-                ))
-            } else {
-                Box::new(Box::pin(
-                    create_anthropic_sse_stream_from_responses_with_web_search_options_for_client(
-                        stream,
-                        hosted_web_search_name.clone(),
-                        hosted_web_search_max_uses,
-                        preserve_redacted_thinking,
-                    ),
-                ))
-            }
+            Box::new(Box::pin(
+                create_resilient_anthropic_sse_stream_from_responses_with_web_search_options_for_client(
+                    Box::pin(stream),
+                    stream_reconnect,
+                    hosted_web_search_name.clone(),
+                    hosted_web_search_max_uses,
+                    preserve_redacted_thinking,
+                ),
+            ))
         } else if api_format == "gemini_native" {
             Box::new(Box::pin(create_anthropic_sse_stream_from_gemini(
                 stream,
