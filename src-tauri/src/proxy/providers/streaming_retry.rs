@@ -429,6 +429,8 @@ pub(crate) fn create_resilient_anthropic_sse_stream_from_responses_with_web_sear
                         reason = format!("reconnect failed: {error}");
                     }
                 }
+                // 连接失败也消耗本次有界重连额度；下一轮重新执行次数检查、退避
+                // 和计数，避免在失败路径上无界快速轰炸上游。
             }
         }
     }
@@ -661,7 +663,12 @@ mod tests {
         .await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 5);
-        assert!(out.contains("after 5 reconnect attempt(s)"), "got: {out}");
+        assert!(
+            out.contains(&format!(
+                "after {RESPONSES_STREAM_MAX_RETRIES} reconnect attempt(s)"
+            )),
+            "got: {out}"
+        );
         assert_eq!(out.matches("event: message_start").count(), 1);
     }
 
@@ -684,6 +691,28 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert!(out.contains("event: message_stop"));
         assert!(!out.contains("event: error"), "unexpected error in: {out}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_failures_are_bounded() {
+        let script = (0..RESPONSES_STREAM_MAX_RETRIES)
+            .map(|_| Err(ProxyError::ForwardFailed("connect refused".into())))
+            .collect();
+        let (reconnector, calls) = scripted_reconnector(script);
+        let first = chunks_then_error(&[created().as_str()]);
+        let out = collect(create_resilient_anthropic_sse_stream_from_responses(
+            first,
+            Some(reconnector),
+        ))
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), RESPONSES_STREAM_MAX_RETRIES);
+        assert!(
+            out.contains(&format!(
+                "after {RESPONSES_STREAM_MAX_RETRIES} reconnect attempt(s)"
+            )),
+            "got: {out}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -5114,9 +5114,9 @@ mod tests {
     }
 
     #[test]
-    fn test_non_codex_omits_reasoning_summary() {
-        // 回归护栏：通用 Responses 供应商不注入 summary——部分后端（或未通过
-        // 组织验证的 OpenAI 账号）会拒绝该参数，维持今日行为。
+    fn test_non_codex_preserves_reasoning_summary_policy() {
+        // 当前 Responses 转换策略对通用供应商同样请求摘要；这与 Codex OAuth
+        // 的 fallback 保持一致，避免回退后又因隐藏思考静默触发下游空闲超时。
         let input = json!({
             "model": "gpt-5.6",
             "max_tokens": 1024,
@@ -5127,7 +5127,7 @@ mod tests {
         let result = anthropic_to_responses(input, None, false, false).unwrap();
 
         assert_eq!(result["reasoning"]["effort"], "xhigh");
-        assert!(result["reasoning"].get("summary").is_none());
+        assert_eq!(result["reasoning"]["summary"], "auto");
     }
 
     #[test]
