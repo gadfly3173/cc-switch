@@ -1,0 +1,240 @@
+name: Development Builds
+
+on:
+  push:
+    branches:
+      - gadfly-dev
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gadfly-dev-build-${{ github.ref }}
+  # Keep every push independently buildable instead of cancelling an earlier artifact run.
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            os: ubuntu-22.04
+          - platform: windows-x86_64
+            os: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'linux-x86_64'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            curl \
+            file \
+            patchelf \
+            libssl-dev \
+            rpm \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev \
+            || sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.0-dev
+          sudo apt-get install -y --no-install-recommends libsoup-3.0-dev \
+            || sudo apt-get install -y --no-install-recommends libsoup2.4-dev
+
+      - name: Setup pnpm
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+        run: |
+          corepack enable
+          corepack install
+          pnpm --version
+
+      - name: Get pnpm store directory
+        id: pnpm-store
+        shell: bash
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: ${{ runner.os }}-${{ matrix.platform }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.platform }}-pnpm-
+
+      - name: Cache Cargo dependencies and target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-${{ matrix.platform }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.platform }}-cargo-
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Linux bundles
+        if: matrix.platform == 'linux-x86_64'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          pnpm tauri build \
+            --bundles appimage,deb,rpm \
+            --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Build Windows bundles
+        if: matrix.platform == 'windows-x86_64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pnpm tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Collect Linux artifacts
+        if: matrix.platform == 'linux-x86_64'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p dev-artifacts
+          short_sha="${GITHUB_SHA:0:7}"
+          bundle_dir="src-tauri/target/release/bundle"
+
+          copy_bundle() {
+            local pattern="$1"
+            local destination="$2"
+            local source
+            source="$(find "$bundle_dir" -type f -iname "$pattern" -print -quit)"
+            if [ -z "$source" ]; then
+              echo "Missing expected Linux bundle: $pattern" >&2
+              exit 1
+            fi
+            cp "$source" "dev-artifacts/$destination"
+          }
+
+          copy_bundle '*.deb' "CC-Switch-gadfly-dev-${short_sha}-Linux-x86_64.deb"
+          copy_bundle '*.AppImage' "CC-Switch-gadfly-dev-${short_sha}-Linux-x86_64.AppImage"
+          copy_bundle '*.rpm' "CC-Switch-gadfly-dev-${short_sha}-Linux-x86_64.rpm"
+          ls -la dev-artifacts
+
+      - name: Collect Windows artifacts
+        if: matrix.platform == 'windows-x86_64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+          $artifactDir = 'dev-artifacts'
+          New-Item -ItemType Directory -Force -Path $artifactDir | Out-Null
+
+          $exe = Join-Path (Get-Location) 'src-tauri/target/release/cc-switch.exe'
+          if (-not (Test-Path -LiteralPath $exe)) {
+            throw "Portable executable not found: $exe"
+          }
+
+          $portableDir = Join-Path $env:RUNNER_TEMP 'cc-switch-portable'
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $portableDir
+          New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
+          Copy-Item -LiteralPath $exe -Destination $portableDir
+          @(
+            '# CC Switch development portable build',
+            'portable=true',
+            'arch=x86_64'
+          ) | Set-Content -Path (Join-Path $portableDir 'portable.ini') -Encoding UTF8
+          $portableZip = Join-Path $artifactDir "CC-Switch-gadfly-dev-$shortSha-Windows-x86_64-Portable.zip"
+          Compress-Archive -Path (Join-Path $portableDir '*') -DestinationPath $portableZip -Force
+
+          $msi = Get-ChildItem -Path 'src-tauri/target/release/bundle' -Recurse -Filter '*.msi' -File | Select-Object -First 1
+          if ($null -eq $msi) {
+            throw 'Windows MSI bundle was not generated'
+          }
+          Copy-Item -LiteralPath $msi.FullName -Destination (Join-Path $artifactDir "CC-Switch-gadfly-dev-$shortSha-Windows-x86_64.msi")
+
+          $installer = Get-ChildItem -Path 'src-tauri/target/release/bundle' -Recurse -Filter '*.exe' -File |
+            Where-Object { $_.Name -ne 'cc-switch.exe' } |
+            Select-Object -First 1
+          if ($null -ne $installer) {
+            Copy-Item -LiteralPath $installer.FullName -Destination (Join-Path $artifactDir "CC-Switch-gadfly-dev-$shortSha-Windows-x86_64-Installer.exe")
+          }
+
+          Get-ChildItem -Path $artifactDir
+
+      - name: Upload Linux deb
+        if: matrix.platform == 'linux-x86_64'
+        uses: actions/upload-artifact@v7
+        with:
+          name: gadfly-dev-linux-x86_64-deb-${{ github.sha }}
+          path: dev-artifacts/*-Linux-x86_64.deb
+          if-no-files-found: error
+          archive: false
+          retention-days: 30
+
+      - name: Upload Linux AppImage
+        if: matrix.platform == 'linux-x86_64'
+        uses: actions/upload-artifact@v7
+        with:
+          name: gadfly-dev-linux-x86_64-appimage-${{ github.sha }}
+          path: dev-artifacts/*-Linux-x86_64.AppImage
+          if-no-files-found: error
+          archive: false
+          retention-days: 30
+
+      - name: Upload Linux rpm
+        if: matrix.platform == 'linux-x86_64'
+        uses: actions/upload-artifact@v7
+        with:
+          name: gadfly-dev-linux-x86_64-rpm-${{ github.sha }}
+          path: dev-artifacts/*-Linux-x86_64.rpm
+          if-no-files-found: error
+          archive: false
+          retention-days: 30
+
+      - name: Upload Windows portable
+        if: matrix.platform == 'windows-x86_64'
+        uses: actions/upload-artifact@v7
+        with:
+          name: gadfly-dev-windows-x86_64-portable-${{ github.sha }}
+          path: dev-artifacts/*-Windows-x86_64-Portable.zip
+          if-no-files-found: error
+          archive: false
+          retention-days: 30
+
+      - name: Upload Windows MSI
+        if: matrix.platform == 'windows-x86_64'
+        uses: actions/upload-artifact@v7
+        with:
+          name: gadfly-dev-windows-x86_64-msi-${{ github.sha }}
+          path: dev-artifacts/*-Windows-x86_64.msi
+          if-no-files-found: error
+          archive: false
+          retention-days: 30
+
+      - name: Upload Windows installer
+        if: matrix.platform == 'windows-x86_64' && hashFiles('dev-artifacts/*-Windows-x86_64-Installer.exe') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: gadfly-dev-windows-x86_64-installer-${{ github.sha }}
+          path: dev-artifacts/*-Windows-x86_64-Installer.exe
+          if-no-files-found: error
+          archive: false
+          retention-days: 30
