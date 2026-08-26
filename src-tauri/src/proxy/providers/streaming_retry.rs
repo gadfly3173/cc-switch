@@ -14,9 +14,10 @@
 //! 重发同一上游请求，并抑制重复的 `message_start`，对客户端完全透明；一旦转发过
 //! 实质内容，行为与现状一致（错误事件透传）。
 //!
-//! 上游语义性失败（`response.failed`/`error` 事件）不重试：那是上游的明确判决，
-//! 与 #5546 在提交边界前的处理保持同一分界。可重试与否由转换器附加的
-//! [`RETRYABLE_STREAM_MARKER`] 注释行标识，而非事件里的 `error.type`——后者
+//! 上游语义性失败（`response.failed`/`error` 事件）通常不重试：那是上游的明确判决，
+//! 与 #5546 在提交边界前的处理保持同一分界。唯一例外是尚未产生实质输出时的
+//! 超时错误，它与传输层中断一样通常是可安全重放的瞬时失败。可重试与否由转换器
+//! 附加的 [`RETRYABLE_STREAM_MARKER`] 注释行标识，而非事件里的 `error.type`——后者
 //! 逐字透传自上游可控字段，不可信。
 //!
 //! 包装器同时承担正常流转期间的思考期心跳：推理模型隐藏思考时上游可整段
@@ -165,9 +166,9 @@ fn scan_chunk(chunk: &str) -> Vec<ScannedEvent> {
 
 /// 只把携带 [`RETRYABLE_STREAM_MARKER`] 注释行的错误事件视为可重试。
 ///
-/// 该标记仅由本进程的转换器在传输层中断（`stream_error`）与无终止事件的
-/// 过早 EOF（`stream_truncated`）时附加。不能改判 `error.type`：上游语义性
-/// 失败的 type 逐字透传自上游可控字段，恰好叫 "stream_error" 时会被误吸收。
+/// 该标记仅由本进程的转换器在传输层错误、无终止事件的过早 EOF，以及尚未产生
+/// 实质输出的上游超时错误下附加。不能改判 `error.type`：上游语义性失败的 type
+/// 逐字透传自上游可控字段，恰好叫 "stream_error" 时会被误吸收。
 fn is_retryable_error_event(event: &ScannedEvent) -> bool {
     event.name == "error"
         && event
@@ -599,6 +600,28 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0, "must not reconnect");
         assert!(out.contains("partial"));
         assert!(out.contains("\"type\":\"stream_error\""));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_semantic_failure_before_content_retries_transparently() {
+        let timeout = sse(
+            "error",
+            json!({"type":"error","error":{"type":"server_error","message":"The operation timed out."}}),
+        );
+        let retry_body = [created(), text_delta("recovered"), completed()].concat();
+        let (reconnector, calls) =
+            scripted_reconnector(vec![Ok(streamed_response(&[retry_body.as_str()]))]);
+        let first = ok_chunks(&[[created(), timeout].concat().as_str()]);
+        let out = collect(create_resilient_anthropic_sse_stream_from_responses(
+            first,
+            Some(reconnector),
+        ))
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(out.contains("recovered"), "got: {out}");
+        assert!(!out.contains("The operation timed out."), "got: {out}");
+        assert_eq!(out.matches("event: message_start").count(), 1);
     }
 
     #[tokio::test(start_paused = true)]

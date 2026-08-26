@@ -55,6 +55,37 @@ fn responses_error_details(data: &Value, fallback: &str) -> (String, String) {
     (message, error_type)
 }
 
+/// 判断 Responses 上游错误是否代表可以在尚未产生实质输出时安全重放的超时。
+///
+/// 一些 Responses 网关会在 HTTP 200 的 SSE 中发送 `error` 或 `response.failed`，
+/// 而不是断开连接；Claude Code 会把该事件直接显示为 API Error，不会把它当成
+/// 可重试的网络故障。超时通常发生在模型还没有输出内容时，重放整次请求与
+/// 传输层中断遵循同一安全边界；其它语义错误仍然必须原样交给客户端。
+pub(crate) fn is_retryable_responses_timeout(error_type: &str, message: &str) -> bool {
+    let error_type = error_type.trim().to_ascii_lowercase();
+    let message = message.trim().to_ascii_lowercase();
+
+    // 错误类型是机器可读的分类，只有明确的 timeout 类型才可确认其语义；错误消息则是上游自由文本，
+    // 只接受常见的瞬时超时表达，避免把提到 timeout 参数的确定性配置错误重复发送。
+    let is_timeout_type = error_type == "timeout"
+        || error_type.ends_with("_timeout")
+        || error_type.ends_with("-timeout")
+        || error_type.ends_with("timeout_error")
+        || error_type.ends_with("timeout-error");
+
+    is_timeout_type
+        || message.contains("timed out")
+        || matches!(
+            message.as_str(),
+            "timeout"
+                | "request timeout"
+                | "upstream timeout"
+                | "gateway timeout"
+                | "server timeout"
+        )
+        || message.contains("deadline exceeded")
+}
+
 pub(crate) fn anthropic_error_sse(message: &str, error_type: &str) -> Bytes {
     anthropic_sse(
         "error",
@@ -69,8 +100,9 @@ fn anthropic_ping_sse() -> Bytes {
     anthropic_sse("ping", &json!({"type": "ping"}))
 }
 
-/// SSE 注释行标记：仅由本转换器在可安全重发整个请求的两种中断场景
-/// （传输层错误、无终止事件的过早 EOF）下随错误事件一起发出。
+/// SSE 注释行标记：仅由本转换器在可安全重发整个请求的三种中断场景
+/// （传输层错误、无终止事件的过早 EOF、尚未产生实质输出的上游超时）下随错误
+/// 事件一起发出。
 ///
 /// streaming_retry 依据该标记判定可重试。不能依据 error.type 判定：上游
 /// 语义性失败的 type 取自上游可控字段（见 `responses_error_details`），
@@ -3779,7 +3811,14 @@ fn create_anthropic_sse_stream_from_responses_raw<E: std::error::Error + Send + 
                                         &data,
                                         "Responses upstream returned a failed terminal response",
                                     );
-                                    yield Ok(anthropic_error_sse(&message, &error_type));
+                                    let error_event = if !has_substantive_output
+                                        && is_retryable_responses_timeout(&error_type, &message)
+                                    {
+                                        retryable_stream_error_sse(&message, &error_type)
+                                    } else {
+                                        anthropic_error_sse(&message, &error_type)
+                                    };
+                                    yield Ok(error_event);
                                     terminated = true;
                                     continue;
                                 }
@@ -4396,7 +4435,14 @@ fn create_anthropic_sse_stream_from_responses_raw<E: std::error::Error + Send + 
                                         "Responses upstream emitted an error event"
                                     },
                                 );
-                                yield Ok(anthropic_error_sse(&message, &error_type));
+                                let error_event = if !has_substantive_output
+                                    && is_retryable_responses_timeout(&error_type, &message)
+                                {
+                                    retryable_stream_error_sse(&message, &error_type)
+                                } else {
+                                    anthropic_error_sse(&message, &error_type)
+                                };
+                                yield Ok(error_event);
                                 terminated = true;
                             }
 
@@ -6122,6 +6168,77 @@ mod tests {
         let obj = response_object_from_event(&data);
         assert_eq!(obj["id"], "resp_1");
         assert_eq!(obj["model"], "gpt-4o");
+    }
+
+    #[test]
+    fn timeout_classifier_accepts_transient_forms_but_rejects_configuration_errors() {
+        for (error_type, message) in [
+            ("server_error", "The operation timed out."),
+            ("server_error", "Request Timeout"),
+            ("timeout_error", "provider failure"),
+            ("server_error", "context deadline exceeded"),
+        ] {
+            assert!(
+                is_retryable_responses_timeout(error_type, message),
+                "expected transient timeout: {error_type}: {message}"
+            );
+        }
+
+        for (error_type, message) in [
+            ("invalid_request_error", "timeout parameter must be positive"),
+            ("invalid_timeout_parameter", "value is unsupported"),
+            ("server_error", "timeout configuration is unsupported"),
+            ("server_error", "backend exploded"),
+        ] {
+            assert!(
+                !is_retryable_responses_timeout(error_type, message),
+                "must not retry deterministic error: {error_type}: {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_timeout_failure_before_content_is_marked_retryable() {
+        let input = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_timeout\",\"model\":\"gpt-5\"}}\n\n",
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"server_error\",\"message\":\"The operation timed out.\"}}\n\n"
+        );
+
+        let merged = convert_stream_text(input).await;
+        assert!(merged.contains(RETRYABLE_STREAM_MARKER));
+        assert!(merged.contains("The operation timed out."));
+    }
+
+    #[tokio::test]
+    async fn test_timeout_after_content_is_not_marked_retryable() {
+        let input = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_timeout\",\"model\":\"gpt-5\"}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"server_error\",\"message\":\"The operation timed out.\"}}\n\n"
+        );
+
+        let merged = convert_stream_text(input).await;
+        assert!(!merged.contains(RETRYABLE_STREAM_MARKER));
+        assert!(merged.contains("The operation timed out."));
+    }
+
+    #[tokio::test]
+    async fn test_failed_terminal_timeout_before_content_is_marked_retryable() {
+        let input = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_timeout\",\"model\":\"gpt-5\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"server_error\",\"message\":\"The operation timed out.\"}}}\n\n"
+        );
+
+        let merged = convert_stream_text(input).await;
+        assert!(merged.contains(RETRYABLE_STREAM_MARKER));
+        assert!(merged.contains("The operation timed out."));
     }
 
     #[tokio::test]

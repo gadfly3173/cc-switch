@@ -13,7 +13,8 @@ use super::{
     provider_router::ProviderRouter,
     providers::{
         codex_chat_history::CodexChatHistoryStore, gemini_shadow::GeminiShadowStore, get_adapter,
-        streaming_retry::StreamReconnector, AuthInfo, AuthStrategy, ProviderAdapter, ProviderType,
+        streaming_responses::is_retryable_responses_timeout, streaming_retry::StreamReconnector,
+        AuthInfo, AuthStrategy, ProviderAdapter, ProviderType,
     },
     thinking_budget_rectifier::{rectify_thinking_budget, should_rectify_thinking_budget},
     thinking_rectifier::{
@@ -2452,7 +2453,9 @@ impl RequestForwarder {
                 } else {
                     // Delay committing the downstream stream until the upstream emits
                     // either productive output or a valid non-failure terminal event.
-                    // A response.failed/error before output remains failover-safe.
+                    // Non-timeout response.failed/error events before output remain
+                    // failover-safe; pre-output timeouts are allowed through so the
+                    // stream-level bounded reconnect can replay the same request.
                     response = self.validate_responses_stream_start(response).await?;
                 }
             }
@@ -3163,7 +3166,9 @@ fn inspect_responses_json_document(buffer: &str) -> Option<Result<(), ProxyError
 
 /// Inspect one complete Responses SSE block while the response is still inside
 /// the retry loop. `None` means the event is lifecycle-only and priming should
-/// continue; `Some(Ok(()))` means it is safe to commit/replay the stream.
+/// continue; `Some(Ok(()))` means it is safe to commit/replay the stream. A
+/// pre-output timeout is also allowed through so the stream converter can mark
+/// it for the same bounded reconnect path as a transport interruption.
 fn inspect_responses_start_event(block: &str) -> Option<Result<(), ProxyError>> {
     let mut named_event = None;
     let mut data_lines = Vec::new();
@@ -3205,6 +3210,11 @@ fn inspect_responses_start_event(block: &str) -> Option<Result<(), ProxyError>> 
             .or_else(|| error.get("code").and_then(Value::as_str))
             .or_else(|| response.get("status").and_then(Value::as_str))
             .unwrap_or("upstream_error");
+        if is_retryable_responses_timeout(error_type, message) {
+            // 放行给 Responses 转换器：它会附加重试标记，让已经提交的
+            // streaming_retry 工厂重放请求，而不是在预热阶段直接结束请求。
+            return Some(Ok(()));
+        }
         return Some(Err(ProxyError::TransformError(format!(
             "Responses upstream {error_type}: {message}"
         ))));
@@ -3223,9 +3233,15 @@ fn inspect_responses_start_event(block: &str) -> Option<Result<(), ProxyError>> 
                 .and_then(Value::as_str)
                 .or_else(|| error.get("code").and_then(Value::as_str))
                 .unwrap_or("upstream_error");
-            Some(Err(ProxyError::TransformError(format!(
-                "Responses upstream {error_type}: {message}"
-            ))))
+            if is_retryable_responses_timeout(error_type, message) {
+                // 超时错误要交给流转换器附加可重试标记；否则预热会在
+                // streaming_retry 获得重连工厂前就把它变成终态错误。
+                Some(Ok(()))
+            } else {
+                Some(Err(ProxyError::TransformError(format!(
+                    "Responses upstream {error_type}: {message}"
+                ))))
+            }
         }
         "response.created" | "response.in_progress" | "response.queued" => None,
         "" => None,
@@ -4524,7 +4540,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_stream_start_semantic_failure_is_retryable() {
+    fn responses_stream_start_semantic_failure_and_timeout_are_classified() {
         let created = concat!(
             "event: response.created\n",
             "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}"
@@ -4545,6 +4561,15 @@ mod tests {
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}"
         );
         assert!(matches!(inspect_responses_start_event(delta), Some(Ok(()))));
+
+        let timeout = concat!(
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"server_error\",\"message\":\"The operation timed out.\"}}"
+        );
+        assert!(matches!(
+            inspect_responses_start_event(timeout),
+            Some(Ok(()))
+        ));
     }
 
     #[test]
